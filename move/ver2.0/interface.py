@@ -58,7 +58,9 @@ class SimulatedRobot:
         :return: numpy array of end effector position
         """
         joint_id = self.m.body(joint_name).id
-        return self.d.geom_xpos[joint_id]
+        
+        #return self.d.geom_xpos[joint_id]
+        return self.d.xpos[joint_id]
 
     def inverse_kinematics(self, ee_target_pos, lr=0.2, joint_name='end_effector'):
         """
@@ -67,7 +69,10 @@ class SimulatedRobot:
         """
         joint_id = self.m.body(joint_name).id
         # get the current end effector position
-        ee_pos = self.d.geom_xpos[joint_id]
+        
+        #ee_pos = self.d.geom_xpos[joint_id]
+        ee_pos = self.d.xpos[joint_id]
+        
         # compute the jacobian
         jac = np.zeros((3, self.m.nv))
         mujoco.mj_jacBodyCom(self.m, self.d, jac, None, joint_id)
