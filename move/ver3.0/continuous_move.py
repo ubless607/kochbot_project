@@ -90,6 +90,14 @@ def get_command_nonblocking():
 #  헬퍼 함수
 # =========================================================
 
+def pwm_to_degree(pwm_value):
+    """
+    다이나믹셀 PWM(0~4095)을 각도(Degree)로 변환
+    XL430/330 기준: 1 tick = 0.088도
+    """
+    # 0 ~ 4095 -> 0 ~ 360도
+    return pwm_value * 0.088
+
 def move_to_pos_blocking(target_full_pwm, robot, sim_robot, m, d, viewer, speed=6, timeout=8.0):
     start_time = time.time()
     curr = np.array(robot.read_position())
@@ -173,7 +181,7 @@ def sweep_until_collision(direction, robot, sim_robot, m, d, viewer):
 def descend_and_detect_z(robot, sim_robot, m, d, viewer):
     curr_pwm = np.array(robot.read_position())
     joint_idx = 1 # J2 (Waist)
-    
+
     print("   >>> 하강 시작 (DESCEND)...")
     
     target_val = Z_SEARCH_CONFIG['LOWEST_J2_PWM']
@@ -200,7 +208,7 @@ def descend_and_detect_z(robot, sim_robot, m, d, viewer):
         err_j4 = abs(curr_pwm[3] - real_pos[3])
         
         THRESH_MAIN = 30
-        THRESH_SUB  = 30
+        THRESH_SUB  = 60
         
         if (err_j2 > THRESH_MAIN) or (err_j3 > THRESH_SUB) or (err_j4 > THRESH_SUB):
             print(f"   !!! 충돌 감지! (J2:{err_j2}, J3:{err_j3}, J4:{err_j4})")
@@ -211,7 +219,7 @@ def descend_and_detect_z(robot, sim_robot, m, d, viewer):
             safe_pwm = real_pos.copy()
             safe_pwm[1] = JOINT_LIMITS[1][1] # 2000
             
-            move_to_pos_blocking(safe_pwm, robot, sim_robot, m, d, viewer, speed=10)
+            move_to_pos_blocking(safe_pwm, robot, sim_robot, m, d, viewer, speed=5)
             return True, collision_pose
 
         cmd = get_command_nonblocking()
@@ -295,7 +303,7 @@ def run_z_search(robot, sim_robot, m, d, viewer, target_j0):
     curr_pwm[3] = JOINT_LIMITS[3][0] # J4 Max
     if not move_to_pos_blocking(curr_pwm, robot, sim_robot, m, d, viewer, speed=5): return curr_pwm
     
-    curr_pwm[2] = JOINT_LIMITS[2][1] # J3 Max
+    curr_pwm[2] = 3150
     if not move_to_pos_blocking(curr_pwm, robot, sim_robot, m, d, viewer, speed=5): return curr_pwm
 
     # [4] 목표 지점으로 스윙 (Swing to Target)
@@ -310,27 +318,41 @@ def run_z_search(robot, sim_robot, m, d, viewer, target_j0):
     curr_pwm[3] = j4_middle
     if not move_to_pos_blocking(curr_pwm, robot, sim_robot, m, d, viewer, speed=5): return curr_pwm
 
+    safe_high_pose = curr_pwm.copy()
+
     # [6] 하강 및 충돌 감지 (The Chop)
     print("Step Z-5: 하강 및 충돌 감지")
     found, collision_pose = descend_and_detect_z(robot, sim_robot, m, d, viewer)
     
     if found:
-        print("=== 높이 측정 성공 ===")
+        print("=== 충돌 감지 성공 ===")
+        
+        # 1. 시뮬레이터 FK로 손끝 높이 계산 (참고용)
         d.qpos[:6] = sim_robot._pwm2pos(collision_pose) + JOINT_OFFSETS
         mujoco.mj_kinematics(m, d)
         ee_pos = sim_robot.read_ee_pos(EE_SITE_NAME)
-        print(f"추정 그리퍼 높이(Z): {ee_pos[2]:.4f}m")
+        
+        # --- [각도 계산 수정] ---
+        j2_pwm = collision_pose[1]
+        raw_deg = pwm_to_degree(j2_pwm)       # 모터 기준 (예: 122.76)
+        
+        # 2048(180도)이 수직 서있는 상태라면, 거기서 얼마나 숙였는지를 나타냄
+        diff_from_center = 180.0 - raw_deg
+        
+        print(f"--------------------------------------------------")
+        print(f"★ 충돌 시점 J2(허리) 데이터 (PWM: {j2_pwm})")
+        print(f"   1. 각도: {diff_from_center:.2f}°")
+        print(f"   2. (참고) 추정 손끝 높이(Z): {ee_pos[2]:.4f}m")
+        print(f"--------------------------------------------------")
+        
+        print("=== [탐색 종료] 안전 높이 복귀 완료 ===")
 
     else:
-        print("=== 높이 측정 실패 ===")
-        # 실패 시에도 안전하게 접기
-        safe_pose = collision_pose.copy()
-        safe_pose[3] = JOINT_LIMITS[3][0]
-        move_to_pos_blocking(safe_pose, robot, sim_robot, m, d, viewer, speed=5)
-        safe_pose[2] = JOINT_LIMITS[2][0]
-        move_to_pos_blocking(safe_pose, robot, sim_robot, m, d, viewer, speed=5)
-        safe_pose[1] = JOINT_LIMITS[1][0]
-        move_to_pos_blocking(safe_pose, robot, sim_robot, m, d, viewer, speed=5)
+        print("=== 높이 측정 실패 (바닥 도달) ===")
+        print("   >>> [복귀] 하강 전 안전 높이로 이동")
+        
+        # final_pose(바닥) -> safe_high_pose(위)
+        move_to_pos_blocking(safe_high_pose, robot, sim_robot, m, d, viewer, speed=6)
         
     return np.array(robot.read_position())
 
