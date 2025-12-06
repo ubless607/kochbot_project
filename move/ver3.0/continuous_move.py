@@ -5,17 +5,18 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 import os
+import math 
 
 from interface import SimulatedRobot
 from robot import Robot
 
-port = 'COM5'
+port = 'COM3'
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'low_cost_robot/scene.xml')
 EE_SITE_NAME = 'joint6'
 
 GRIPPER_OPEN_PWM  = 2979
 GRIPPER_CLOSE_PWM = 1901
-
+JOINT6_POSITION = None
 # --- [설정 1] 오프셋 (User Settings) ---
 JOINT_OFFSETS = np.array([0.00, 0.25, -1.57, 0.00, 2.29, 0.00])
 
@@ -128,6 +129,15 @@ def move_to_pos_blocking(target_full_pwm, robot, sim_robot, m, d, viewer, speed=
         time.sleep(0.01)
     return True
 
+def calc_radius_and_center(angle_diff,position,ee=0.05):
+    distance=math.sqrt(position[0]**2+position[1]**2)+ee
+    s=math.sin(angle_diff/2*math.pi/180)
+    radius=distance*s/(1-s)
+    cx=position[0]*(1+(radius+ee)/distance)
+    cy=position[1]*(1+(radius+ee)/distance)
+    center=cx,cy
+    return radius, center
+
 def find_safe_floor_j2(current_pose, target_j2, sim_robot, m, d):
     """안전 착륙 지점 계산 (시뮬레이션 예지)"""
     test_pose = current_pose.copy()
@@ -213,8 +223,19 @@ def descend_and_detect_z(robot, sim_robot, m, d, viewer):
 
         if (err_j2 > THRESH_MAIN) or (err_j3 > THRESH_SUB) or (err_j4 > THRESH_SUB):
             print(f"   !!! 충돌 감지! (J2:{err_j2}, J3:{err_j3}, J4:{err_j4})")
+            for _ in range(50):
+                # 꺾임 상쇄
+                curr_pwm[1] += (Z_SEARCH_CONFIG['DESCEND_SPEED'])
+                robot.set_goal_pos(curr_pwm)
+                d.qpos[:6] = sim_robot._pwm2pos(curr_pwm) + JOINT_OFFSETS
+                mujoco.mj_step(m, d)
+                viewer.sync()
+                time.sleep(0.01)
+            
+            real_pos = np.array(robot.read_position())
             collision_pose = real_pos.copy()
-
+            time.sleep(1)
+            print("위치 저장")
             # [긴급 회피] J2 최대 상승
             print("   >>> [긴급 회피] J2 최대 상승 (Lift Up)")
             safe_pwm = real_pos.copy()
@@ -301,8 +322,24 @@ def run_pincer_search(robot, sim_robot, m, d, viewer):
 
         if max_error > threshold:
             print(f"!!! 충돌 감지! Step: {i}/{steps} (Max Error: {max_error})")
-
             collision_detected = True
+
+            position=sim_robot.read_ee_pos(joint_name='joint6') # joint6의 위치
+            distance=math.sqrt(position[0]**2+position[1]**2)
+            print(f"base-joint6 최단거리:{distance}")
+
+            angle_err=math.asin(0.02/distance) # 로봇팔 두께로 인한 각도 오차
+            angle_diff=abs(pwm_to_degree(angle_left)-pwm_to_degree(angle_right)) # 로봇팔 각도차
+            angle_diff-=(angle_err*180/math.pi)
+
+            # 물체의 반지름 및 중심 계산
+            radius,center=calc_radius_and_center(angle_diff,position)
+            print(f"물체 반지름: {radius}")
+            print(f"물체 중점 좌표: {center}")
+            
+            # 마지막 충돌에서의 joint6 위치 저장
+            global JOINT6_POSITION
+            JOINT6_POSITION=position
 
             # 텐션 완화를 위한 백오프 (Back-off)
             back_off_pwm = curr_target - (target_pwm - start_pwm) * 0.1
@@ -390,21 +427,16 @@ def run_z_search(robot, sim_robot, m, d, viewer, target_j0):
         # 1. 시뮬레이터 FK로 손끝 높이 계산 (참고용)
         d.qpos[:6] = sim_robot._pwm2pos(collision_pose) + JOINT_OFFSETS
         mujoco.mj_kinematics(m, d)
-        ee_pos = sim_robot.read_ee_pos(EE_SITE_NAME)
 
-        # --- [각도 계산 수정] ---
-        j2_pwm = collision_pose[1]
-        raw_deg = pwm_to_degree(j2_pwm)       # 모터 기준 (예: 122.76)
-
-        # 2048(180도)이 수직 서있는 상태라면, 거기서 얼마나 숙였는지를 나타냄
-        diff_from_center = 180.0 - raw_deg
-
+        joint5_pos=sim_robot.read_ee_pos('joint5')
+        joint2_pos=sim_robot.read_ee_pos('joint2')
+        tan=(joint5_pos[2]-joint2_pos[2]-0.01)/(math.sqrt((joint5_pos[1]-joint2_pos[1])**2+(joint5_pos[0]-joint2_pos[0])**2))
+        distance = math.sqrt(JOINT6_POSITION[0]**2 + JOINT6_POSITION[1]**2)
+        height=(distance * tan + 0.06) * 100 # base와 joint2 높이차(6cm) 추가
         print(f"--------------------------------------------------")
-        print(f"★ 충돌 시점 J2(허리) 데이터 (PWM: {j2_pwm})")
-        print(f"   1. 각도: {diff_from_center:.2f}°")
-        print(f"   2. (참고) 추정 손끝 높이(Z): {ee_pos[2]:.4f}m")
+        print(f"각도: {math.atan(tan)*180/math.pi}°")
+        print(f"물체 높이: {height:.1f}cm")
         print(f"--------------------------------------------------")
-
         print("=== [탐색 종료] 안전 높이 복귀 완료 ===")
 
     else:
@@ -454,7 +486,7 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
                 # 중앙값 추출 (final_pwm[0]가 중앙임)
                 LAST_FOUND_CENTER_J0 = final_pwm[0]
                 print(f"★ 중앙값 기억됨: {LAST_FOUND_CENTER_J0}")
-
+                
                 curr_pwm = final_pwm.copy()
                 target_pwm = final_pwm.copy()
                 key = ''
